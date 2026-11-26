@@ -5,7 +5,11 @@ CSCI3341 Artificial Intelligence Final Project.
 
 ## Usage
 
-Make sure to download models with the `util/download_models.sh` script first. Thanks @jcjohnson!
+The model installer needs `curl` and GNU coreutils. Obtain an independently verified SHA-256 digest for the [Oxford VGG-19 Caffe weights](https://www.robots.ox.ac.uk/~vgg/research/very_deep/), then run from the project directory.
+
+    VGG19_SHA256='replace-with-verified-sha256' sh util/download_models.sh
+
+The published model metadata does not include a SHA-256 digest. The installer requires one before it will download any weights and only installs a matching file.
 
     python art.py --help
 
@@ -32,4 +36,8 @@ The best [Gassongram](https://www.instagram.com/explore/tags/gassongram/) ever:
 
 ## Where do I get all this art?
 
-`util/wikiart-scraper.py` contains a neat script which will automatically scrape **every** painting for a given artist from [wikiart](http://wikiart.org). Simply specify the URL component of the artist's name (e.g. `pablo-picasso`) in the `ARTISTS` array in the script.
+Set `ARTISTS` in `util/wikiart-scraper.py` to the WikiArt slugs you want to fetch, such as `pablo-picasso`. The optional fetcher uses Python 3.9 or later.
+
+    python3 util/wikiart-scraper.py
+
+The script saves up to 100 JPEGs per artist from the links embedded in the public gallery page, under `wikiart/<artist>/`.
