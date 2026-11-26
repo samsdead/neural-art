@@ -1,136 +1,145 @@
-"""
-Automatically scrape paintings by specified artists from wikiart.
+"""Download JPEGs listed in public WikiArt artist galleries."""
 
-Jesse Mu
-"""
-
-import requests
-from bs4 import BeautifulSoup
+from html.parser import HTMLParser
 import os
-from collections import defaultdict
-from fake_useragent import UserAgent  # Hehe
+from pathlib import Path
+import re
+import sys
+from tempfile import NamedTemporaryFile
+from time import monotonic
+from urllib.parse import urlsplit, urlunsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-# Global constants
-ARTIST_URL = 'http://wikiart.org/en/{artist}/mode/all-paintings/{page}'
-IMG_URL = 'http://uploads4.wikiart.org/images/{artist}/{painting}/jpg'
-ARTISTS = ['pablo-picasso']
-FAKE_HEADERS = {'User-Agent': UserAgent().random}
-IMG_DIR = '../wikiart/{artist}'
-BASE_DIR = IMG_DIR.format(artist='')
-
-
-def total_pages(soup):
-    """
-    Given an artist's parsed BeautifulSoup page, determine how many
-    pages there are (there's a predictable pattern).
-    """
-    pager_items = soup.find('div', {'class': 'pager-items'})
-    pager_links = pager_items.find_all('a')
-    for pager, next_pager in zip(pager_links, pager_links[1:]):
-        # There's always a "next" link before the last page
-        if next_pager.text == 'Next':
-            return int(pager.text)
-
-    # If here, we haven't found a last page
-    canonical = soup.find('link', {'rel': 'canonical'})['href']
-    raise ValueError("Couldn't find last page for {}".format(canonical))
+ARTIST_URL = "https://www.wikiart.org/en/{artist}/mode/allpaintings"
+ARTISTS = ["pablo-picasso"]
+IMAGE_DIR = Path(__file__).resolve().parent.parent / "wikiart"
+MAX_PAGE_BYTES = 4 * 1024 * 1024
+MAX_IMAGE_BYTES = 12 * 1024 * 1024
+MAX_PAINTINGS = 100
 
 
-def raise_if_bad(request_obj, url='undef'):
-    """Throw a helpful error message when a request fails."""
+class NoRedirects(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class Gallery(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.sources = []
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if tag == "img" and attributes.get("src"):
+            self.sources.append(attributes["src"])
+        if attributes.get("ng-controller") == "MasonryCtrl":
+            gallery = attributes.get("ng-init") or ""
+            self.sources.extend(re.findall(r'"image"\s*:\s*"([^"]+)"', gallery))
+
+
+def painting_link(source, artist):
+    if not source:
+        return None
+
     try:
-        request_obj.raise_for_status()
-    except requests.exceptions.HTTPError as e:
-            print "wikiart-scraper.py: Error trying to retrieve {}".format(
-                request_obj.url
-            )
-            raise e
+        parts = urlsplit(source.partition("!")[0])
+    except ValueError:
+        return None
 
+    if parts.scheme not in {"http", "https", ""} or not re.fullmatch(
+        r"uploads[0-9]?\.wikiart\.org", parts.netloc, re.IGNORECASE
+    ):
+        return None
 
-def clean_painting_url(painting_url):
-    """
-    Clean the painting url by removing the size specification.
-
-    Might be other things later.
-    """
-    splitted = painting_url.split('!')
-    assert len(splitted) == 2, 'url {} has more than one !'.format(
-        painting_url
+    image = re.fullmatch(
+        rf"/(?:[0-9]+/)?images/{re.escape(artist)}/"
+        r"([a-z0-9][a-z0-9_.-]{0,180}\.jpe?g)",
+        parts.path,
+        re.IGNORECASE,
     )
-    return splitted[0]
+    if not image:
+        return None
+
+    filename = image.group(1)
+    stem = filename.partition(".")[0].upper()
+    if re.fullmatch(r"AUX|CON|NUL|PRN|(?:COM|LPT)[1-9]", stem):
+        return None
+
+    return urlunsplit(("https", parts.netloc.lower(), parts.path, "", "")), filename
 
 
-def save_painting(link, directory):
-    """
-    Actually request the url and save the painting into the directory.
-    """
-    r_img = requests.get(link, stream=True)
-    raise_if_bad(r_img, link)
+def fetch(opener, url, media_type, max_bytes):
+    request = Request(url, headers={"User-Agent": "neural-art-wikiart-client/1.0"})
+    deadline = monotonic() + 45
+    content = bytearray()
+    with opener.open(request, timeout=10) as response:
+        if response.status != 200 or response.headers.get_content_type() != media_type:
+            raise ValueError("Unexpected response status or content type.")
+        while True:
+            if monotonic() >= deadline:
+                raise ValueError("Response exceeded the download time limit.")
+            chunk = response.read1(min(65536, max_bytes + 1 - len(content)))
+            if not chunk:
+                return content
+            content.extend(chunk)
+            if len(content) > max_bytes:
+                raise ValueError("Response exceeded the download size limit.")
 
-    # Get name by splitting on slash and getting the last element
-    img_name = link.split('/')[-1]
-    # Unicode error screwing this up
-    # print u"Saving img %s in directory %s" % (unicode(img_name), directory + '/')
-    with open(directory + '/' + img_name, 'wb') as fout:
-        fout.write(r_img.content)
+
+def save_painting(opener, url, destination):
+    image = fetch(opener, url, "image/jpeg", MAX_IMAGE_BYTES)
+    if not image.startswith(b"\xff\xd8\xff") or not image.endswith(b"\xff\xd9"):
+        raise ValueError("Response did not have JPEG start and end markers.")
+
+    temporary = None
+    try:
+        with NamedTemporaryFile(dir=destination.parent, delete=False) as output:
+            temporary = Path(output.name)
+            output.write(image)
+        os.replace(temporary, destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
-def scrape_paintings(soup, directory=BASE_DIR):
-    """
-    Scrape the given artist page and save images into the specified
-    directory.
+def scrape_artist(opener, artist):
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", artist):
+        raise ValueError("ARTISTS entries must be WikiArt slugs.")
+    url = ARTIST_URL.format(artist=artist)
+    page = fetch(opener, url, "text/html", MAX_PAGE_BYTES)
 
-    ADDITIONALLY, return a list of names of paintings scraped.
-    """
-    # Make artist directory if it doesn't exist
-    if not os.path.exists(directory):
-        os.makedirs(directory)
+    gallery = Gallery()
+    gallery.feed(page.decode("utf-8", errors="replace"))
+    gallery.close()
+    links = {}
+    for source in gallery.sources:
+        link = painting_link(source, artist)
+        if link:
+            image_url, filename = link
+            links.setdefault(filename, image_url)
+    if not links:
+        raise ValueError("The public gallery did not contain matching JPEG links.")
 
-    # Class "Paintings" contains all links
-    soup_paintings = soup.find('div', {'class': 'Painting'})
-    # Just get all links - they should all be paintings
-    soup_imgs = [s['src'] for s in soup_paintings.find_all('img')]
-    # But double check just to make sure
-    cleaned_links = [clean_painting_url(s) for s in soup_imgs
-                     if 'jpg' in s and 'uploads' in s]
-    for link in cleaned_links:
-        save_painting(link, directory)
-
-    return cleaned_links
+    directory = IMAGE_DIR / artist
+    if IMAGE_DIR.is_symlink() or directory.is_symlink():
+        raise ValueError("Image directory must not be a symbolic link.")
+    directory.mkdir(parents=True, exist_ok=True)
+    for index, (filename, image_url) in enumerate(links.items()):
+        if index == MAX_PAINTINGS:
+            break
+        save_painting(opener, image_url, directory / filename)
 
 
 def main():
-    # Create the img directory if it doesn't exist.
-    if not os.getcwd().endswith('util'):
-        print "You ought to run this script from the util directory for " + \
-              "accurate save locations (see IMG_DIR)"
-        return
-    if not os.path.exists(BASE_DIR):
-        os.makedirs(BASE_DIR)
+    opener = build_opener(NoRedirects())
+    try:
+        for artist in ARTISTS:
+            scrape_artist(opener, artist)
+    except (OSError, ValueError) as error:
+        print(f"wikiart-scraper.py: {error}", file=sys.stderr)
+        return 1
+    return 0
 
-    artist_paintings = defaultdict(list)
-    for artist in ARTISTS:
-        r_artist = requests.get(
-            ARTIST_URL.format(artist=artist, page=1), headers=FAKE_HEADERS
-        )
-        raise_if_bad(r_artist, url=r_artist.url)
-        soup = BeautifulSoup(r_artist.text, 'lxml')  # Default to lmxl parser
-        for i in xrange(1, total_pages(soup)):
-            r_artist_page = requests.get(
-                ARTIST_URL.format(artist=artist, page=i),
-                headers=FAKE_HEADERS
-            )
-            raise_if_bad(r_artist_page, url=r_artist_page.url)
-            soup_page = BeautifulSoup(r_artist_page.text, 'lxml')
 
-            # Download the paintings!
-            paintings = scrape_paintings(
-                soup_page,
-                directory=IMG_DIR.format(artist=artist)
-            )
-
-            # Add paintings to the dictionary
-            artist_paintings[artist].extend(paintings)
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    sys.exit(main())
