@@ -24,6 +24,7 @@ from itertools import izip_longest
 from datetime import datetime
 import os
 import glob
+from hashlib import sha256
 
 # Make matplotlib not use X11
 matplotlib.use('Agg')
@@ -409,10 +410,28 @@ def debug_print(msg, verbose=True):
         print "{}: {}".format(datetime.now(), msg)
 
 
+def verify_weights(path):
+    expected = os.environ.get('VGG19_SHA256', '').lower()
+    if len(expected) != 64 or any(character not in '0123456789abcdef' for character in expected):
+        raise SystemExit('Set VGG19_SHA256 to an independently verified SHA-256 for the VGG-19 weights.')
+
+    digest = sha256()
+    try:
+        with open(path, 'rb') as weights:
+            for chunk in iter(lambda: weights.read(1024 * 1024), b''):
+                digest.update(chunk)
+    except IOError:
+        raise SystemExit('Could not read the VGG-19 weights. Run util/download_models.sh first.')
+
+    if digest.hexdigest() != expected:
+        raise SystemExit('The VGG-19 weights failed SHA-256 verification.')
+
+
 def main(args):
     """
     The main algorithm implementation function.
     """
+    verify_weights(VGG_MODEL)
     vgg = caffe.Net(
         VGG_PROTOTXT, VGG_MODEL, caffe.TEST,
     )

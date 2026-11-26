@@ -7,9 +7,10 @@ CSCI3341 Artificial Intelligence Final Project.
 
 The model installer needs `curl` and GNU coreutils. Obtain an independently verified SHA-256 digest for the [Oxford VGG-19 Caffe weights](https://www.robots.ox.ac.uk/~vgg/research/very_deep/), then run from the project directory.
 
-    VGG19_SHA256='replace-with-verified-sha256' sh util/download_models.sh
+    export VGG19_SHA256='replace-with-verified-sha256'
+    sh util/download_models.sh
 
-The published model metadata does not include a SHA-256 digest. The installer requires one before it will download any weights and only installs a matching file.
+The published model metadata does not include a SHA-256 digest. The installer requires one before downloading weights and installs only a matching file. Keep it set when running `art.py`, which checks the file again before loading it into Caffe. Use the legacy Python 2 and Caffe stack in an isolated environment with local files you trust.
 
     python art.py --help
 
